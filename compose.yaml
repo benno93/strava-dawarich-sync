@@ -1,6 +1,8 @@
 services:
   strava-sync:
-    build: .
+    image: ghcr.io/benno93/strava-dawarich-sync:latest
+    # To build the image yourself instead, replace the line above with:
+    # build: .
     container_name: strava-sync
     restart: unless-stopped
     env_file: .env

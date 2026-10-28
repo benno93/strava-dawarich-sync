@@ -8,7 +8,7 @@ Importiert deine Strava-Aktivitäten automatisch in deine selbst gehostete [Dawa
 - Jede Aktivität mit GPS: Laufen, Rad, Wandern, Schwimmen, …. Aktivitäten ohne GPS (Laufband, Rolle, Kraft) werden übersprungen
 - **Erzeugt nie Duplikate**, auch wenn der lokale Stand verloren geht
 - Kommt mit Stravas Rate-Limits selbst klar: pausiert und macht weiter
-- Ein kleiner Docker-Container, eine Abhängigkeit (`requests`)
+- Fertiges Docker-Image für `amd64` und `arm64` (z. B. Raspberry Pi), veröffentlicht erst, wenn alle Tests grün sind
 
 ## Du brauchst
 
@@ -35,11 +35,13 @@ Dawarich → **Account-Einstellungen** → **API-Key** kopieren.
 ### 3. Herunterladen und konfigurieren
 
 ```sh
-git clone https://github.com/benno93/strava-dawarich-sync.git
-cd strava-dawarich-sync
-cp .env.example .env
+mkdir strava-dawarich-sync && cd strava-dawarich-sync
+curl -O https://raw.githubusercontent.com/benno93/strava-dawarich-sync/main/compose.yaml
+curl -o .env https://raw.githubusercontent.com/benno93/strava-dawarich-sync/main/.env.example
 nano .env
 ```
+
+Mehr brauchst du nicht: `compose.yaml` lädt das fertige Image von `ghcr.io`.
 
 Diese vier Zeilen ausfüllen, den Rest so lassen:
 
@@ -67,7 +69,7 @@ docker compose run --rm strava-sync python authorize.py
 ### 5. Starten
 
 ```sh
-docker compose up -d --build
+docker compose up -d
 docker logs -f strava-sync
 ```
 
@@ -142,7 +144,7 @@ Alle Einstellungen stehen in `.env`. Nach einer Änderung: `docker compose up -d
 |---|---|
 | Log anzeigen | `docker logs -f strava-sync` |
 | Sofort einmal laufen lassen | `docker compose restart strava-sync` |
-| Aktualisieren | `git pull && docker compose up -d --build` |
+| Aktualisieren | `docker compose pull && docker compose up -d` |
 | Stoppen | `docker compose down` |
 | Alles neu importieren | In Dawarich die `strava_*`-Imports löschen, dann `rm data/state.json` und `docker compose restart strava-sync` |
 
@@ -169,6 +171,10 @@ Sie hat kein GPS (manueller Eintrag, Laufband) oder ist durch `SPORT_TYPES` ausg
 - Alles läuft auf deinem eigenen Rechner. Daten fließen nur Strava → dein Server → dein Dawarich
 - Jeder Nutzer legt seine eigene Strava-API-App an. Das Tool ist für den Import **deiner eigenen** Daten gedacht
 
+## Selbst bauen
+
+Lieber ohne fertiges Image? Repo klonen und in `compose.yaml` die Zeile `image:` durch `build: .` ersetzen. Dann `docker compose up -d --build`.
+
 ## Entwicklung
 
 ```sh
@@ -176,7 +182,7 @@ pip install -r requirements.txt pytest
 pytest
 ```
 
-Die Tests laufen gegen nachgebaute Strava- und Dawarich-APIs; keine Accounts nötig.
+Die Tests laufen gegen nachgebaute Strava- und Dawarich-APIs; keine Accounts nötig. Jeder Push auf `main` lässt die Tests laufen und veröffentlicht nur bei Erfolg `ghcr.io/benno93/strava-dawarich-sync:latest`. Tags wie `v1.2.0` veröffentlichen zusätzlich `:1.2.0` und `:1`.
 
 ## Lizenz
 
