@@ -154,6 +154,16 @@ def upload_gpx(base_url, filename, gpx):
 
 # ---------- Main ----------
 
+def is_virtual(activity):
+    """Zwift, ROUVY, MyWhoosh & co.: virtual sport types or indoor trainer activities.
+    Their GPS points lie in virtual worlds (or on routes you never physically rode)."""
+    return str(activity.get("sport_type", "")).startswith("Virtual") or bool(activity.get("trainer"))
+
+
+def env_bool(name, default):
+    return os.environ.get(name, str(default)).strip().lower() in ("1", "true", "yes")
+
+
 def parse_sport_types(raw):
     """Empty or 'all' -> None (every sport type). Otherwise a set of Strava sport_type values."""
     raw = (raw or "").strip()
@@ -166,7 +176,8 @@ def main():
     base_url = env("DAWARICH_URL").rstrip("/")
     sport_types = parse_sport_types(os.environ.get("SPORT_TYPES", "all"))
     lookback = int(env("LOOKBACK_DAYS", "14"))
-    dry_run = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
+    dry_run = env_bool("DRY_RUN", False)
+    skip_virtual = env_bool("SKIP_VIRTUAL", True)
 
     state = load_json(state_file(), {"newest_start": 0, "imported": [], "skipped": []})
     imported = set(state["imported"])
@@ -182,7 +193,7 @@ def main():
     newest_start = state["newest_start"]
     # Look back a few days to catch activities a watch uploads late
     after_epoch = max(0, newest_start - lookback * 86400) if newest_start else 0
-    counts = {"imported": 0, "no_gps": 0, "errors": 0}
+    counts = {"imported": 0, "no_gps": 0, "virtual": 0, "errors": 0}
     complete = True
 
     def persist():
@@ -199,6 +210,9 @@ def main():
             if sport_types and act.get("sport_type") not in sport_types:
                 continue
             if aid in imported or aid in skipped:
+                continue
+            if skip_virtual and is_virtual(act):
+                counts["virtual"] += 1
                 continue
             if not act.get("start_latlng"):
                 skipped.add(aid)
@@ -239,7 +253,7 @@ def main():
         persist()
 
     log(f"Done: {counts['imported']} imported, {counts['no_gps']} without GPS, "
-        f"{counts['errors']} errors")
+        f"{counts['virtual']} virtual skipped, {counts['errors']} errors")
     sys.exit(1 if counts["errors"] else 0)
 
 

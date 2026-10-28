@@ -5,7 +5,8 @@ Importiert deine Strava-Aktivitäten automatisch in deine selbst gehostete [Dawa
 🇬🇧 [English version](README.md)
 
 - Importiert beim ersten Start deine **komplette Strava-Historie**, danach stündlich neue Aktivitäten
-- Jede Aktivität mit GPS: Laufen, Rad, Wandern, Schwimmen, …. Aktivitäten ohne GPS (Laufband, Rolle, Kraft) werden übersprungen
+- Jede Aktivität mit GPS: Laufen, Rad, Wandern, Schwimmen, …. Aktivitäten ohne GPS (Laufband, Kraft) werden übersprungen
+- **Virtuelle Fahrten und Läufe (Zwift, ROUVY, MyWhoosh, …) werden übersprungen**, damit keine falschen Ausflüge nach Watopia in deiner Standort-Historie landen
 - **Erzeugt nie Duplikate**, auch wenn der lokale Stand verloren geht
 - Kommt mit Stravas Rate-Limits selbst klar: pausiert und macht weiter
 - Fertiges Docker-Image für `amd64` und `arm64` (z. B. Raspberry Pi), veröffentlicht erst, wenn alle Tests grün sind
@@ -133,10 +134,32 @@ Alle Einstellungen stehen in `.env`. Nach einer Änderung: `docker compose up -d
 | `STRAVA_CLIENT_SECRET` | – | Von strava.com/settings/api |
 | `DAWARICH_URL` | – | Deine Dawarich-Adresse, z. B. `https://dawarich.example.com` |
 | `DAWARICH_API_KEY` | – | Aus den Dawarich-Account-Einstellungen |
+| `SKIP_VIRTUAL` | `true` | Virtuelle Aktivitäten überspringen: Sportarten `VirtualRide`/`VirtualRun`/`VirtualRow` und alles, was als Indoor-Trainer markiert ist |
 | `SPORT_TYPES` | `all` | `all` oder kommagetrennte [Strava-Sportarten](https://developers.strava.com/docs/reference/#api-models-SportType), z. B. `Run,TrailRun,Ride` |
 | `SYNC_INTERVAL_MINUTES` | `60` | Abstand zwischen zwei Läufen |
 | `LOOKBACK_DAYS` | `14` | Tage, die jeder Lauf erneut prüft (siehe oben) |
 | `DRY_RUN` | `false` | `true` schreibt GPX-Dateien nach `data/gpx/` und lädt nichts hoch |
+
+## Virtuelle Aktivitäten (Zwift, ROUVY, …)
+
+Apps wie Zwift oder ROUVY laden Fahrten mit GPS-Koordinaten einer virtuellen Welt hoch oder einer echten Strecke, die du nie selbst gefahren bist. In Dawarich sähe das aus, als wärst du dort gewesen. `SKIP_VIRTUAL=true` (Standard) hält sie draußen.
+
+**Schon welche mit einer älteren Version importiert?** So entfernst du sie:
+
+```sh
+docker compose run --rm strava-sync python cleanup_virtual.py
+```
+
+1. Das ist eine **Vorschau**: Sie listet die gefundenen virtuellen Aktivitäten in Dawarich und ändert nichts
+2. Liste prüfen, dann ihre Punkte löschen:
+
+```sh
+docker compose run --rm strava-sync python cleanup_virtual.py --delete
+```
+
+✅ Erfolgreich: `Done: N points deleted from M virtual activities.`
+
+Die Import-Einträge bleiben mit 0 Punkten in Dawarich stehen, damit sie nie erneut importiert werden. Löschen kannst du sie bei Bedarf in der Dawarich-Oberfläche.
 
 ## Häufige Aufgaben
 

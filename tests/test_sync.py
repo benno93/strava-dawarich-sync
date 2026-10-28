@@ -11,6 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "app"))
 
 import authorize  # noqa: E402
+import cleanup_virtual  # noqa: E402
 import common  # noqa: E402
 import sync  # noqa: E402
 
@@ -46,19 +47,41 @@ class FakeResponse:
             raise sync.requests.HTTPError(str(self.status_code))
 
 
+VIRTUAL = [
+    {"id": 10, "sport_type": "VirtualRide", "start_date": "2026-10-05T18:00:00Z",
+     "name": "Zwift - Watopia", "start_latlng": [-11.6, 166.9], "trainer": False},
+    {"id": 11, "sport_type": "Ride", "start_date": "2026-10-06T18:00:00Z",
+     "name": "ROUVY route", "start_latlng": [47.1, 11.4], "trainer": True},
+]
+
+
 class FakeServers:
-    def __init__(self, existing_imports=()):
-        self.imports = [{"name": n} for n in existing_imports]
+    def __init__(self, existing_imports=(), activities=None):
+        self.activities = ACTIVITIES if activities is None else activities
+        self.imports = []
+        for n in existing_imports:
+            self._add_import(n)
         self.uploads = []
         self.upload_status = 201
+        self.points = {}  # import_id -> [point ids]
+        self.deleted = []
+
+    def _add_import(self, name):
+        imp_id = len(self.imports) + 1
+        self.imports.append({"id": imp_id, "name": name})
+        return imp_id
 
     def get(self, url, headers=None, params=None, timeout=None):
         if url.endswith("/athlete/activities"):
-            return FakeResponse(200, ACTIVITIES if params["page"] == 1 else [])
+            return FakeResponse(200, self.activities if params["page"] == 1 else [])
         if "/streams" in url:
             return FakeResponse(200, STREAMS)
         if url.endswith("/api/v1/imports"):
             return FakeResponse(200, self.imports, {"X-Total-Pages": "1"})
+        if url.endswith("/api/v1/points"):
+            ids = self.points.get(params["import_id"], [])
+            return FakeResponse(200, [{"id": i} for i in ids],
+                                {"X-Total-Pages": "1" if ids else "0"})
         raise AssertionError(f"unexpected GET {url}")
 
     def post(self, url, headers=None, files=None, timeout=None, data=None):
@@ -66,8 +89,14 @@ class FakeServers:
         if self.upload_status != 201:
             return FakeResponse(self.upload_status, {"error": "boom"})
         self.uploads.append((name, content.decode()))
-        self.imports.append({"name": name})
+        imp_id = self._add_import(name)
+        self.points[imp_id] = [imp_id * 100 + 1, imp_id * 100 + 2]
         return FakeResponse(201, {})
+
+    def delete(self, url, headers=None, json=None, timeout=None):
+        assert url.endswith("/api/v1/points/bulk_destroy")
+        self.deleted.extend(json["point_ids"])
+        return FakeResponse(200, {"count": len(json["point_ids"])})
 
 
 @pytest.fixture
@@ -84,9 +113,14 @@ def env(tmp_path, monkeypatch):
     return tmp_path
 
 
-def run(monkeypatch, servers):
+def patch(monkeypatch, servers):
     monkeypatch.setattr(sync.requests, "get", servers.get)
     monkeypatch.setattr(sync.requests, "post", servers.post)
+    monkeypatch.setattr(sync.requests, "delete", servers.delete)
+
+
+def run(monkeypatch, servers):
+    patch(monkeypatch, servers)
     with pytest.raises(SystemExit) as exc:
         sync.main()
     return exc.value.code
@@ -192,3 +226,44 @@ def test_authorize_parses_redirect_url():
     assert code == "abc123"
     assert "activity:read_all" in scope
     assert authorize.parse_code("abc123") == ("abc123", "")
+
+
+def test_virtual_activities_are_skipped_by_default(env, monkeypatch):
+    servers = FakeServers(activities=ACTIVITIES + VIRTUAL)
+    run(monkeypatch, servers)
+    names = [u[0] for u in servers.uploads]
+    assert "strava_10.gpx" not in names and "strava_11.gpx" not in names
+    assert "strava_1.gpx" in names
+
+
+def test_virtual_activities_can_be_included(env, monkeypatch):
+    monkeypatch.setenv("SKIP_VIRTUAL", "false")
+    servers = FakeServers(activities=ACTIVITIES + VIRTUAL)
+    run(monkeypatch, servers)
+    names = [u[0] for u in servers.uploads]
+    assert "strava_10.gpx" in names and "strava_11.gpx" in names
+
+
+def test_cleanup_preview_changes_nothing(env, monkeypatch):
+    monkeypatch.setenv("SKIP_VIRTUAL", "false")
+    servers = FakeServers(activities=ACTIVITIES + VIRTUAL)
+    run(monkeypatch, servers)
+    assert cleanup_virtual.main([]) == 0
+    assert servers.deleted == []
+
+
+def test_cleanup_deletes_only_points_of_virtual_imports(env, monkeypatch):
+    monkeypatch.setenv("SKIP_VIRTUAL", "false")
+    servers = FakeServers(activities=ACTIVITIES + VIRTUAL)
+    run(monkeypatch, servers)
+    by_name = {imp["name"]: imp["id"] for imp in servers.imports}
+    expected = servers.points[by_name["strava_10.gpx"]] + servers.points[by_name["strava_11.gpx"]]
+    assert cleanup_virtual.main(["--delete"]) == 0
+    assert sorted(servers.deleted) == sorted(expected)
+
+
+def test_is_virtual():
+    assert sync.is_virtual({"sport_type": "VirtualRide"})
+    assert sync.is_virtual({"sport_type": "VirtualRun"})
+    assert sync.is_virtual({"sport_type": "Ride", "trainer": True})
+    assert not sync.is_virtual({"sport_type": "Ride", "trainer": False})
