@@ -490,7 +490,7 @@ def test_points_are_read_in_slim_format(env, monkeypatch):
     assert seen[0]["slim"] == "true"
 
 
-def test_own_track_is_not_kept_in_memory(env, monkeypatch):
+def test_no_second_read_without_foreign_candidates(env, monkeypatch):
     servers = FakeServers(existing_imports=["strava_1.gpx"])
     servers.add_own(1, 101, epoch(1))
     servers.add_own(1, 102, epoch(1, second=30))
