@@ -11,8 +11,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "app"))
 
 import authorize  # noqa: E402
+import cleanup_overlaps  # noqa: E402
 import cleanup_virtual  # noqa: E402
 import common  # noqa: E402
+import overlap  # noqa: E402
 import sync  # noqa: E402
 
 ACTIVITIES = [
@@ -64,24 +66,51 @@ class FakeServers:
         self.uploads = []
         self.upload_status = 201
         self.points = {}  # import_id -> [point ids]
+        self.timestamps = {}  # point id -> epoch, for all points including foreign ones
         self.deleted = []
+        self.processing = False  # True: uploads stay unprocessed, like a busy Dawarich
+        self.after_window_read = None
 
     def _add_import(self, name):
         imp_id = len(self.imports) + 1
         self.imports.append({"id": imp_id, "name": name})
         return imp_id
 
+    def add_foreign(self, point_id, timestamp):
+        self.timestamps[point_id] = timestamp
+
+    def add_own(self, import_id, point_id, timestamp):
+        self.points.setdefault(import_id, []).append(point_id)
+        self.timestamps[point_id] = timestamp
+
+    def import_id(self, name):
+        return next(imp["id"] for imp in self.imports if imp["name"] == name)
+
+    def _points_response(self, params):
+        if params["page"] > 1:
+            return FakeResponse(200, [], {"X-Total-Pages": "0"})
+        if "import_id" in params:
+            ids = self.points.get(params["import_id"], [])
+        else:
+            ids = [i for i, ts in self.timestamps.items()
+                   if params["start_at"] <= ts <= params["end_at"]]
+            if self.after_window_read:
+                self.after_window_read()
+        return FakeResponse(200, [{"id": i, "timestamp": self.timestamps[i]} for i in ids],
+                            {"X-Total-Pages": "1"})
+
     def get(self, url, headers=None, params=None, timeout=None):
         if url.endswith("/athlete/activities"):
-            return FakeResponse(200, self.activities if params["page"] == 1 else [])
+            if params["page"] > 1:
+                return FakeResponse(200, [])
+            return FakeResponse(200, [a for a in self.activities
+                                      if sync.parse_start(a).timestamp() > params["after"]])
         if "/streams" in url:
             return FakeResponse(200, STREAMS)
         if url.endswith("/api/v1/imports"):
             return FakeResponse(200, self.imports, {"X-Total-Pages": "1"})
         if url.endswith("/api/v1/points"):
-            ids = self.points.get(params["import_id"], [])
-            return FakeResponse(200, [{"id": i} for i in ids],
-                                {"X-Total-Pages": "1" if ids else "0"})
+            return self._points_response(params)
         raise AssertionError(f"unexpected GET {url}")
 
     def post(self, url, headers=None, files=None, timeout=None, data=None):
@@ -90,13 +119,30 @@ class FakeServers:
             return FakeResponse(self.upload_status, {"error": "boom"})
         self.uploads.append((name, content.decode()))
         imp_id = self._add_import(name)
-        self.points[imp_id] = [imp_id * 100 + 1, imp_id * 100 + 2]
+        if not self.processing:
+            for i, ts in enumerate(gpx_timestamps(content.decode()), 1):
+                self.add_own(imp_id, imp_id * 100 + i, ts)
         return FakeResponse(201, {})
 
     def delete(self, url, headers=None, json=None, timeout=None):
         assert url.endswith("/api/v1/points/bulk_destroy")
         self.deleted.extend(json["point_ids"])
+        for i in json["point_ids"]:
+            self.timestamps.pop(i, None)
+            for ids in self.points.values():
+                if i in ids:
+                    ids.remove(i)
         return FakeResponse(200, {"count": len(json["point_ids"])})
+
+
+def gpx_timestamps(gpx):
+    ns = {"g": "http://www.topografix.com/GPX/1/1"}
+    return [int(datetime.fromisoformat(t.text.replace("Z", "+00:00")).timestamp())
+            for t in ET.fromstring(gpx).findall(".//g:trkpt/g:time", ns)]
+
+
+def epoch(day, hour=6, minute=0, second=0):
+    return int(datetime(2026, 10, day, hour, minute, second, tzinfo=timezone.utc).timestamp())
 
 
 @pytest.fixture
@@ -108,6 +154,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("DAWARICH_API_KEY", "key")
     monkeypatch.delenv("SPORT_TYPES", raising=False)
     monkeypatch.delenv("DRY_RUN", raising=False)
+    monkeypatch.delenv("SKIP_VIRTUAL", raising=False)
+    monkeypatch.delenv("REPLACE_OVERLAPPING_POINTS", raising=False)
     common.save_json(common.tokens_file(), {
         "access_token": "a", "refresh_token": "r", "expires_at": time.time() + 9999})
     return tmp_path
@@ -267,3 +315,190 @@ def test_is_virtual():
     assert sync.is_virtual({"sport_type": "VirtualRun"})
     assert sync.is_virtual({"sport_type": "Ride", "trainer": True})
     assert not sync.is_virtual({"sport_type": "Ride", "trainer": False})
+
+
+# ---------- Overlapping points from other sources ----------
+
+ONE_RUN = [ACTIVITIES[0]]  # own points at 06:00:00 and 06:00:30 on Oct 1
+
+
+def test_split_windows():
+    assert overlap.split_windows([]) == []
+    assert overlap.split_windows([100]) == [(100, 100)]
+    assert overlap.split_windows([100, 400, 701, 702]) == [(100, 400), (701, 702)]
+    assert overlap.split_windows([702, 100]) == [(100, 100), (702, 702)]
+
+
+def test_overlapping_points_stay_by_default(env, monkeypatch):
+    servers = FakeServers(activities=ONE_RUN)
+    servers.add_foreign(9001, epoch(1, second=15))
+    assert run(monkeypatch, servers) == 0
+    assert servers.deleted == []
+
+
+def test_replaces_only_foreign_points_inside_the_track(env, monkeypatch):
+    monkeypatch.setenv("REPLACE_OVERLAPPING_POINTS", "true")
+    servers = FakeServers(activities=ONE_RUN)
+    servers.add_foreign(9001, epoch(1, second=15))
+    servers.add_foreign(9002, epoch(1, second=59))  # just after the track
+    assert run(monkeypatch, servers) == 0
+    assert servers.deleted == [9001]
+    assert len(servers.points[servers.import_id("strava_1.gpx")]) == 2
+
+
+def test_second_run_deletes_nothing_more(env, monkeypatch):
+    monkeypatch.setenv("REPLACE_OVERLAPPING_POINTS", "true")
+    servers = FakeServers(activities=ONE_RUN)
+    servers.add_foreign(9001, epoch(1, second=15))
+    run(monkeypatch, servers)
+    run(monkeypatch, servers)
+    assert servers.deleted == [9001]
+
+
+def test_foreign_points_arriving_late_are_replaced(env, monkeypatch):
+    monkeypatch.setenv("REPLACE_OVERLAPPING_POINTS", "true")
+    servers = FakeServers(activities=ONE_RUN)
+    run(monkeypatch, servers)
+    servers.add_foreign(9001, epoch(1, second=15))
+    run(monkeypatch, servers)
+    assert servers.deleted == [9001]
+
+
+def test_unprocessed_import_deletes_nothing_until_it_has_points(env, monkeypatch):
+    monkeypatch.setenv("REPLACE_OVERLAPPING_POINTS", "true")
+    servers = FakeServers(activities=ONE_RUN)
+    servers.add_foreign(9001, epoch(1, second=15))
+    servers.processing = True
+    assert run(monkeypatch, servers) == 0
+    assert servers.deleted == []
+
+    imp_id = servers.import_id("strava_1.gpx")
+    servers.add_own(imp_id, 101, epoch(1))
+    servers.add_own(imp_id, 102, epoch(1, second=30))
+    assert run(monkeypatch, servers) == 0
+    assert servers.deleted == [9001]
+
+
+def test_points_in_a_long_pause_stay(env, monkeypatch):
+    monkeypatch.setenv("REPLACE_OVERLAPPING_POINTS", "true")
+    servers = FakeServers(existing_imports=["strava_1.gpx"], activities=ONE_RUN)
+    servers.add_own(1, 101, epoch(1))
+    servers.add_own(1, 102, epoch(1, minute=30))
+    servers.add_foreign(9001, epoch(1, minute=15))  # coffee stop
+    assert run(monkeypatch, servers) == 0
+    assert servers.deleted == []
+
+
+def test_own_point_added_while_checking_is_not_deleted(env, monkeypatch):
+    monkeypatch.setenv("REPLACE_OVERLAPPING_POINTS", "true")
+    servers = FakeServers(existing_imports=["strava_1.gpx"], activities=ONE_RUN)
+    servers.add_own(1, 101, epoch(1))
+    servers.add_own(1, 102, epoch(1, second=30))
+    servers.add_own(1, 103, epoch(1, second=15))
+    # Simulates Dawarich still importing: 103 only shows up for the import after the window read
+    servers.points[1].remove(103)
+    servers.after_window_read = lambda: servers.points[1].append(103) if 103 not in servers.points[1] else None
+    assert run(monkeypatch, servers) == 0
+    assert servers.deleted == []
+
+
+def test_overlapping_strava_activities_do_not_delete_each_other(env, monkeypatch):
+    monkeypatch.setenv("REPLACE_OVERLAPPING_POINTS", "true")
+    same_time = [ACTIVITIES[0], {**ACTIVITIES[0], "id": 5}]
+    servers = FakeServers(activities=same_time)
+    assert run(monkeypatch, servers) == 0
+    assert servers.deleted == []
+
+
+def test_activity_before_the_window_still_counts_as_own(env, monkeypatch):
+    monkeypatch.setenv("REPLACE_OVERLAPPING_POINTS", "true")
+    long_ride = {**ACTIVITIES[1], "id": 7, "start_date": "2026-10-01T06:00:00Z"}
+    recent = {**ACTIVITIES[0], "id": 8, "start_date": "2026-10-20T06:00:00Z"}
+    servers = FakeServers(existing_imports=["strava_7.gpx", "strava_8.gpx"],
+                          activities=[long_ride, recent])
+    common.save_json(common.state_file(), {
+        "newest_start": epoch(20), "imported": [7, 8], "skipped": []})
+    servers.add_own(1, 101, epoch(20))  # the ride's points lie inside the recent activity
+    servers.add_own(2, 201, epoch(20))
+    assert run(monkeypatch, servers) == 0
+    assert servers.deleted == []
+
+
+def test_virtual_activity_replaces_nothing(env, monkeypatch):
+    monkeypatch.setenv("REPLACE_OVERLAPPING_POINTS", "true")
+    monkeypatch.setenv("SKIP_VIRTUAL", "false")
+    servers = FakeServers(activities=[VIRTUAL[0]])
+    servers.add_foreign(9001, epoch(5, 18, second=15))
+    assert run(monkeypatch, servers) == 0
+    assert servers.deleted == []
+
+
+def test_nothing_is_deleted_if_the_journal_fails(env, monkeypatch):
+    monkeypatch.setenv("REPLACE_OVERLAPPING_POINTS", "true")
+    servers = FakeServers(activities=ONE_RUN)
+    servers.add_foreign(9001, epoch(1, second=15))
+    overlap.journal_file().mkdir()  # opening a directory for writing fails
+    assert run(monkeypatch, servers) == 1
+    assert servers.deleted == []
+    assert state(env)["newest_start"] == 0  # time window not moved, retried next run
+
+
+def test_deleted_points_are_in_the_journal(env, monkeypatch):
+    monkeypatch.setenv("REPLACE_OVERLAPPING_POINTS", "true")
+    servers = FakeServers(activities=ONE_RUN)
+    servers.add_foreign(9001, epoch(1, second=15))
+    run(monkeypatch, servers)
+    entry = json.loads(overlap.journal_file().read_text().splitlines()[0])
+    assert entry["strava_import"] == "strava_1.gpx"
+    assert entry["point"]["id"] == 9001
+
+
+def test_dry_run_replaces_nothing(env, monkeypatch):
+    monkeypatch.setenv("REPLACE_OVERLAPPING_POINTS", "true")
+    monkeypatch.setenv("DRY_RUN", "true")
+    servers = FakeServers(existing_imports=["strava_1.gpx"], activities=ONE_RUN)
+    servers.add_own(1, 101, epoch(1))
+    servers.add_own(1, 102, epoch(1, second=30))
+    servers.add_foreign(9001, epoch(1, second=15))
+    assert run(monkeypatch, servers) == 0
+    assert servers.deleted == []
+    assert not overlap.journal_file().exists()
+
+
+def test_fetch_points_ignores_a_wrong_page_count(env, monkeypatch):
+    calls = []
+
+    def get(url, headers=None, params=None, timeout=None):
+        calls.append(params["page"])
+        return FakeResponse(200, [{"id": params["page"]}] if params["page"] <= 2 else [],
+                            {"X-Total-Pages": "1"})
+
+    monkeypatch.setattr(sync.requests, "get", get)
+    assert [p["id"] for p in common.fetch_points("https://x", import_id=1)] == [1, 2]
+    assert calls == [1, 2, 3]
+
+
+def test_cleanup_overlaps_preview_changes_nothing(env, monkeypatch):
+    servers = FakeServers(activities=ONE_RUN)
+    run(monkeypatch, servers)
+    servers.add_foreign(9001, epoch(1, second=15))
+    assert cleanup_overlaps.main([]) == 0
+    assert servers.deleted == []
+
+
+def test_cleanup_overlaps_deletes_foreign_points_only(env, monkeypatch):
+    servers = FakeServers(activities=ONE_RUN)
+    run(monkeypatch, servers)
+    servers.add_foreign(9001, epoch(1, second=15))
+    servers.add_foreign(9002, epoch(2))
+    assert cleanup_overlaps.main(["--delete"]) == 0
+    assert servers.deleted == [9001]
+
+
+def test_cleanup_overlaps_ignores_virtual_tracks(env, monkeypatch):
+    monkeypatch.setenv("SKIP_VIRTUAL", "false")
+    servers = FakeServers(activities=[VIRTUAL[0]])
+    run(monkeypatch, servers)
+    servers.add_foreign(9001, epoch(5, 18, second=15))
+    assert cleanup_overlaps.main(["--delete"]) == 0
+    assert servers.deleted == []

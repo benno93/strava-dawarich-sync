@@ -6,7 +6,6 @@ Two layers of duplicate protection:
      so no duplicates appear even if state.json is lost.
 """
 import os
-import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -14,10 +13,14 @@ from xml.sax.saxutils import escape
 
 import requests
 
-from common import data_dir, env, get_access_token, load_json, log, save_json, state_file
+from common import (
+    data_dir, dawarich_headers, dawarich_strava_imports, env, get_access_token, load_json, log,
+    save_json, state_file,
+)
+from overlap import delete_foreign_points, find_foreign_points
 
 STRAVA_API = "https://www.strava.com/api/v3"
-NAME_RE = re.compile(r"^strava_(\d+)")
+OWN_MARGIN_DAYS = 7
 
 
 class DailyLimitReached(Exception):
@@ -120,28 +123,6 @@ def build_gpx(activity, streams):
 
 # ---------- Dawarich ----------
 
-def dawarich_headers():
-    return {"Authorization": f"Bearer {env('DAWARICH_API_KEY')}"}
-
-
-def dawarich_imported_ids(base_url):
-    """Strava IDs that already exist in Dawarich, based on import names."""
-    ids, page = set(), 1
-    while True:
-        r = requests.get(
-            f"{base_url}/api/v1/imports", headers=dawarich_headers(),
-            params={"page": page, "per_page": 100}, timeout=60,
-        )
-        r.raise_for_status()
-        for imp in r.json():
-            m = NAME_RE.match(imp.get("name", ""))
-            if m:
-                ids.add(int(m.group(1)))
-        if page >= int(r.headers.get("X-Total-Pages", page)):
-            return ids
-        page += 1
-
-
 def upload_gpx(base_url, filename, gpx):
     r = requests.post(
         f"{base_url}/api/v1/imports", headers=dawarich_headers(),
@@ -172,12 +153,36 @@ def parse_sport_types(raw):
     return {s.strip() for s in raw.split(",") if s.strip()}
 
 
+def replace_overlaps(base_url, token, after_epoch, dry_run):
+    """Replace points from other sources for activities in the lookback window. Returns the
+    number of points replaced. Activities shortly before the window can still overlap one
+    inside it, so their points count as own too."""
+    imports = dawarich_strava_imports(base_url)
+    targets, own = [], []
+    for act in list_activities(token, max(0, after_epoch - OWN_MARGIN_DAYS * 86400)):
+        imp = imports.get(act["id"])
+        if not imp:
+            continue
+        own.append(imp)
+        # A virtual track is not where you really were, so it must not replace anything
+        if parse_start(act).timestamp() >= after_epoch and not is_virtual(act):
+            targets.append(imp)
+
+    foreign = find_foreign_points(base_url, targets, own)
+    if dry_run:
+        for name, points in foreign.items():
+            log(f"Would replace {len(points)} points from other sources with {name}")
+        return 0
+    return delete_foreign_points(base_url, foreign)
+
+
 def main():
     base_url = env("DAWARICH_URL").rstrip("/")
     sport_types = parse_sport_types(os.environ.get("SPORT_TYPES", "all"))
     lookback = int(env("LOOKBACK_DAYS", "14"))
     dry_run = env_bool("DRY_RUN", False)
     skip_virtual = env_bool("SKIP_VIRTUAL", True)
+    replace_overlapping = env_bool("REPLACE_OVERLAPPING_POINTS", False)
 
     state = load_json(state_file(), {"newest_start": 0, "imported": [], "skipped": []})
     imported = set(state["imported"])
@@ -185,7 +190,7 @@ def main():
 
     if not dry_run:
         try:
-            imported |= dawarich_imported_ids(base_url)
+            imported |= set(dawarich_strava_imports(base_url))
         except requests.RequestException as e:
             sys.exit(f"ERROR: Dawarich unreachable or API key wrong: {e}")
 
@@ -193,7 +198,7 @@ def main():
     newest_start = state["newest_start"]
     # Look back a few days to catch activities a watch uploads late
     after_epoch = max(0, newest_start - lookback * 86400) if newest_start else 0
-    counts = {"imported": 0, "no_gps": 0, "virtual": 0, "errors": 0}
+    counts = {"imported": 0, "no_gps": 0, "virtual": 0, "replaced": 0, "errors": 0}
     complete = True
 
     def persist():
@@ -242,6 +247,14 @@ def main():
                 counts["errors"] += 1
                 complete = False
                 log(f"ERROR on {aid}: {e}")  # not marked as done -> retried next run
+
+        if replace_overlapping:
+            try:
+                counts["replaced"] = replace_overlaps(base_url, token, after_epoch, dry_run)
+            except (RuntimeError, OSError, requests.RequestException) as e:
+                counts["errors"] += 1
+                complete = False
+                log(f"ERROR replacing overlapping points: {e}")  # retried next run
     except DailyLimitReached:
         complete = False
         log("Strava daily rate limit reached. The next run continues where this one stopped.")
@@ -253,7 +266,8 @@ def main():
         persist()
 
     log(f"Done: {counts['imported']} imported, {counts['no_gps']} without GPS, "
-        f"{counts['virtual']} virtual skipped, {counts['errors']} errors")
+        f"{counts['virtual']} virtual skipped, {counts['replaced']} overlapping points replaced, "
+        f"{counts['errors']} errors")
     sys.exit(1 if counts["errors"] else 0)
 
 

@@ -7,7 +7,8 @@ Automatically import your Strava activities into your self-hosted [Dawarich](htt
 - Imports your **entire Strava history** on the first run, then checks for new activities every hour
 - Every activity with GPS: runs, rides, hikes, swims, …. Activities without GPS (treadmill, strength) are skipped
 - **Virtual rides and runs (Zwift, ROUVY, MyWhoosh, …) are skipped**, so no fake trips to Watopia end up in your location history
-- **Never creates duplicates**, even if you lose the local state
+- **Never imports an activity twice**, even if you lose the local state
+- **Optional: replaces overlapping points from OwnTracks & co.** with the Strava track, so a trip doesn't show up twice on the map
 - Handles Strava's rate limits on its own: pauses and continues
 - Ready-made Docker image for `amd64` and `arm64` (e.g. Raspberry Pi), published only after all tests pass
 
@@ -133,6 +134,7 @@ All settings live in `.env`. After a change: `docker compose up -d`.
 | `DAWARICH_URL` | – | Your Dawarich URL, e.g. `https://dawarich.example.com` |
 | `DAWARICH_API_KEY` | – | From Dawarich account settings |
 | `SKIP_VIRTUAL` | `true` | Skip virtual activities: sport types `VirtualRide`/`VirtualRun`/`VirtualRow` and anything marked as indoor trainer |
+| `REPLACE_OVERLAPPING_POINTS` | `false` | `true` deletes points from other sources in the time span of a Strava track (see below) |
 | `SPORT_TYPES` | `all` | `all` or a comma-separated list of [Strava sport types](https://developers.strava.com/docs/reference/#api-models-SportType), e.g. `Run,TrailRun,Ride` |
 | `SYNC_INTERVAL_MINUTES` | `60` | Time between runs |
 | `LOOKBACK_DAYS` | `14` | Days re-checked on each run (see above) |
@@ -158,6 +160,52 @@ docker compose run --rm strava-sync python cleanup_virtual.py --delete
 ✅ Success: `Done: N points deleted from M virtual activities.`
 
 The import entries stay in Dawarich with 0 points, so they're never imported again. You can delete them in the Dawarich UI if you like.
+
+## Overlapping tracks (OwnTracks & co.)
+
+If your phone also sends your location to Dawarich, an activity gets recorded twice: by the watch and by the phone. The two never measure exactly the same place, so Dawarich keeps both and you see two tracks on top of each other.
+
+With `REPLACE_OVERLAPPING_POINTS=true` the Strava track wins:
+
+- Each run deletes points from every other source in the time span of a Strava track. That includes other imports, not just live tracking
+- Pauses longer than 5 minutes split the time span, so a coffee stop recorded by your phone stays
+- It only covers activities in the `LOOKBACK_DAYS` window, so phone data that arrives late is handled too, but **older years stay untouched** until you run the cleanup below. Virtual activities never replace anything
+- Exception: without `data/state.json` (fresh install, deleted `data/`) a run covers your whole history, including older years, once their imports are processed
+- It waits until Dawarich has finished processing the Strava import, so it can take a run or two after the upload
+
+**⚠️ This deletes points from Dawarich.** Each one is first saved to `data/overlap_deleted.jsonl`, but there is no restore command, and that file can't bring back a point's link to its import. A wrong clock on your watch would remove points from the wrong time, so do one test run first. It uploads and deletes nothing and logs what would be replaced:
+
+```sh
+docker compose pull
+docker compose run --rm -e DRY_RUN=true -e REPLACE_OVERLAPPING_POINTS=true strava-sync python sync.py
+```
+
+**To clean up your whole history, including past years:**
+
+1. Wait for the first import to finish, back up Dawarich, and get the latest image in your `strava-dawarich-sync` folder with `docker compose pull`
+2. Run a preview that changes nothing:
+
+   ```sh
+   docker compose run --rm strava-sync python cleanup_overlaps.py
+   ```
+
+3. Check the list. It shows the number of points per activity, so look closely at activities with unusually many. Everything in the time span of a Strava track that isn't from a `strava_*` import would go, including older imports such as Google Timeline data or GPX files you uploaded by hand
+4. Delete those points:
+
+   ```sh
+   docker compose run --rm strava-sync python cleanup_overlaps.py --delete
+   ```
+
+✅ Success: `Done: N points deleted from M Strava activities.`
+
+With hundreds of activities this takes a while and can put noticeable load on your Dawarich instance. It uses very few Strava requests.
+
+**To keep it clean from now on**, add `REPLACE_OVERLAPPING_POINTS=true` to `.env` (older `.env` files don't have this line yet), then apply it and check the log:
+
+```sh
+docker compose pull && docker compose up -d
+docker logs -f strava-sync
+```
 
 ## Common tasks
 

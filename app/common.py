@@ -1,6 +1,7 @@
-"""Shared helpers: configuration, token handling, JSON files."""
+"""Shared helpers: configuration, token handling, JSON files, Dawarich API."""
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -8,6 +9,8 @@ from pathlib import Path
 import requests
 
 STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
+NAME_RE = re.compile(r"^strava_(\d+)")
+BULK_LIMIT = 5000
 
 
 def data_dir():
@@ -77,3 +80,56 @@ def get_access_token():
             {"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"]}
         )
     return tokens["access_token"]
+
+
+def dawarich_headers():
+    return {"Authorization": f"Bearer {env('DAWARICH_API_KEY')}"}
+
+
+def dawarich_strava_imports(base_url):
+    """{strava_id: dawarich_import} for every strava_<id>.gpx import."""
+    found, page = {}, 1
+    while True:
+        r = requests.get(
+            f"{base_url}/api/v1/imports", headers=dawarich_headers(),
+            params={"page": page, "per_page": 100}, timeout=60,
+        )
+        r.raise_for_status()
+        for imp in r.json():
+            m = NAME_RE.match(imp.get("name", ""))
+            if m:
+                found[int(m.group(1))] = imp
+        if page >= int(r.headers.get("X-Total-Pages", page)):
+            return found
+        page += 1
+
+
+def fetch_points(base_url, **filters):
+    """Points matching the filters. Reads until an empty page: deleting relies on a
+    complete list, and X-Total-Pages comes from a cached counter."""
+    points, page = [], 1
+    while True:
+        r = requests.get(
+            f"{base_url}/api/v1/points", headers=dawarich_headers(),
+            params={**filters, "include_anomalies": "true", "per_page": 10000, "page": page},
+            timeout=120,
+        )
+        r.raise_for_status()
+        batch = r.json()
+        if not batch:
+            return points
+        points.extend(batch)
+        page += 1
+
+
+def delete_points(base_url, ids):
+    deleted = 0
+    for i in range(0, len(ids), BULK_LIMIT):
+        r = requests.delete(
+            f"{base_url}/api/v1/points/bulk_destroy", headers=dawarich_headers(),
+            json={"point_ids": ids[i:i + BULK_LIMIT]}, timeout=300,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"Dawarich returned {r.status_code}: {r.text[:300]}")
+        deleted += r.json().get("count", 0)
+    return deleted
