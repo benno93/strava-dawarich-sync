@@ -105,13 +105,15 @@ def dawarich_strava_imports(base_url):
 
 
 def fetch_points(base_url, **filters):
-    """Points matching the filters. Reads until an empty page: deleting relies on a
-    complete list, and X-Total-Pages comes from a cached counter."""
+    """Points matching the filters, in Dawarich's slim format: full points are many times
+    larger and a whole history doesn't fit in memory. Reads until an empty page: deleting
+    relies on a complete list, and X-Total-Pages comes from a cached counter."""
     points, page = [], 1
     while True:
         r = requests.get(
             f"{base_url}/api/v1/points", headers=dawarich_headers(),
-            params={**filters, "include_anomalies": "true", "per_page": 10000, "page": page},
+            params={**filters, "include_anomalies": "true", "slim": "true",
+                    "per_page": 10000, "page": page},
             timeout=120,
         )
         r.raise_for_status()

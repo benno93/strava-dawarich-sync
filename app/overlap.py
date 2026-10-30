@@ -15,6 +15,7 @@ import time
 from common import data_dir, delete_points, fetch_points, log
 
 PAUSE_GAP = 300
+PROGRESS_EVERY = 25
 
 
 def journal_file():
@@ -36,22 +37,30 @@ def find_foreign_points(base_url, targets, own_imports):
     """{import name: [points from other sources]} inside the tracks of the target imports.
     `own_imports` must cover every Strava import that could overlap with a target."""
     candidates = {}
-    for imp in targets:
-        timestamps = [int(p["timestamp"]) for p in fetch_points(base_url, import_id=imp["id"])]
-        for start, end in split_windows(timestamps):
+    for done, imp in enumerate(targets, 1):
+        track = fetch_points(base_url, import_id=imp["id"])
+        track_ids = {p["id"] for p in track}
+        # Most points in a window are the track itself; keeping them would fill the memory
+        for start, end in split_windows(int(p["timestamp"]) for p in track):
             for p in fetch_points(base_url, start_at=start, end_at=end):
-                candidates.setdefault(p["id"], (imp["name"], p))
+                if p["id"] not in track_ids:
+                    candidates.setdefault(p["id"], (imp["name"], p))
+        if done % PROGRESS_EVERY == 0:
+            log(f"Checked {done}/{len(targets)} activities ...")
+    if len(targets) >= PROGRESS_EVERY:
+        log(f"Comparing with the points of {len(own_imports)} Strava imports ...")
 
     # Read the own points last: a point Dawarich adds in between is then in this list if it
     # is in the candidates, so a running import can never be mistaken for a foreign source.
-    own = set()
     for imp in own_imports:
-        own.update(p["id"] for p in fetch_points(base_url, import_id=imp["id"]))
+        if not candidates:
+            break
+        for p in fetch_points(base_url, import_id=imp["id"]):
+            candidates.pop(p["id"], None)
 
     foreign = {}
-    for point_id, (name, point) in candidates.items():
-        if point_id not in own:
-            foreign.setdefault(name, []).append(point)
+    for name, point in candidates.values():
+        foreign.setdefault(name, []).append(point)
     return foreign
 
 

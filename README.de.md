@@ -175,7 +175,7 @@ Mit `REPLACE_OVERLAPPING_POINTS=true` gewinnt die Strava-Spur:
 - Ausnahme: Ohne `data/state.json` (Neuinstallation, gelöschtes `data/`) erfasst ein Lauf die gesamte Historie samt älterer Jahre, sobald deren Importe verarbeitet sind
 - Es wartet, bis Dawarich den Strava-Import verarbeitet hat. Nach dem Upload kann es also ein bis zwei Läufe dauern
 
-**⚠️ Das löscht Punkte aus Dawarich.** Jeder Punkt wird vorher in `data/overlap_deleted.jsonl` gesichert, es gibt aber keinen Wiederherstellungsbefehl, und die Verknüpfung zum Import lässt sich aus der Datei nicht zurückholen. Eine falsche Uhrzeit auf der Uhr würde Punkte aus dem falschen Zeitraum entfernen. Mach deshalb zuerst einen Testlauf. Er lädt nichts hoch, löscht nichts und protokolliert, was ersetzt würde:
+**⚠️ Das löscht Punkte aus Dawarich.** Position und Zeit jedes Punkts werden vorher in `data/overlap_deleted.jsonl` gesichert, es gibt aber keinen Wiederherstellungsbefehl, und Details wie die Höhe oder die Verknüpfung zum Import lassen sich aus der Datei nicht zurückholen. Eine falsche Uhrzeit auf der Uhr würde Punkte aus dem falschen Zeitraum entfernen. Mach deshalb zuerst einen Testlauf. Er lädt nichts hoch, löscht nichts und protokolliert, was ersetzt würde:
 
 ```sh
 docker compose pull

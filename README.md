@@ -173,7 +173,7 @@ With `REPLACE_OVERLAPPING_POINTS=true` the Strava track wins:
 - Exception: without `data/state.json` (fresh install, deleted `data/`) a run covers your whole history, including older years, once their imports are processed
 - It waits until Dawarich has finished processing the Strava import, so it can take a run or two after the upload
 
-**⚠️ This deletes points from Dawarich.** Each one is first saved to `data/overlap_deleted.jsonl`, but there is no restore command, and that file can't bring back a point's link to its import. A wrong clock on your watch would remove points from the wrong time, so do one test run first. It uploads and deletes nothing and logs what would be replaced:
+**⚠️ This deletes points from Dawarich.** The position and time of each one are first saved to `data/overlap_deleted.jsonl`, but there is no restore command, and that file can't bring back details such as altitude or a point's link to its import. A wrong clock on your watch would remove points from the wrong time, so do one test run first. It uploads and deletes nothing and logs what would be replaced:
 
 ```sh
 docker compose pull

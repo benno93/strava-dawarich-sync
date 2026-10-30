@@ -478,6 +478,37 @@ def test_fetch_points_ignores_a_wrong_page_count(env, monkeypatch):
     assert calls == [1, 2, 3]
 
 
+def test_points_are_read_in_slim_format(env, monkeypatch):
+    seen = []
+
+    def get(url, headers=None, params=None, timeout=None):
+        seen.append(params)
+        return FakeResponse(200, [])
+
+    monkeypatch.setattr(sync.requests, "get", get)
+    common.fetch_points("https://x", import_id=1)
+    assert seen[0]["slim"] == "true"
+
+
+def test_own_track_is_not_kept_in_memory(env, monkeypatch):
+    servers = FakeServers(existing_imports=["strava_1.gpx"])
+    servers.add_own(1, 101, epoch(1))
+    servers.add_own(1, 102, epoch(1, second=30))
+    patch(monkeypatch, servers)
+    calls = []
+    original_get = servers.get
+
+    def spy(url, headers=None, params=None, timeout=None):
+        calls.append(params)
+        return original_get(url, headers, params, timeout)
+
+    monkeypatch.setattr(sync.requests, "get", spy)
+    imp = {"id": 1, "name": "strava_1.gpx"}
+    assert overlap.find_foreign_points("https://x", [imp], [imp]) == {}
+    # Without foreign candidates the own points don't need a second read
+    assert sum("import_id" in c for c in calls) == 2  # one page plus the empty one
+
+
 def test_cleanup_overlaps_preview_changes_nothing(env, monkeypatch):
     servers = FakeServers(activities=ONE_RUN)
     run(monkeypatch, servers)
